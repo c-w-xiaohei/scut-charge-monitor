@@ -6,7 +6,6 @@ import os
 import logging
 from io import BytesIO
 from PIL import Image
-from litellm import completion
 from dotenv import load_dotenv
 
 # --- 日志配置 ---
@@ -45,6 +44,7 @@ class ScutChargeMonitor:
         self.keyboard_info = None
         self.jsessionid = None  # 用于存储会话Cookie
         self.REDIRECT_URL = 'https://ecardwxnew.scut.edu.cn/berserker-base/redirect'
+        self.last_error = "登录失败"
 
     def _get_captcha_data(self):
         """获取验证码的key和Base64编码的图像数据。"""
@@ -58,6 +58,7 @@ class ScutChargeMonitor:
             logging.info("获取验证码和Key成功。")
             return captcha_key, captcha_image_base64
         except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError, AttributeError) as e:
+            self.last_error = f"获取验证码失败：{e}"
             logging.error(f"获取验证码失败: {e}")
             return None, None
 
@@ -74,9 +75,11 @@ class ScutChargeMonitor:
                 logging.info("键盘加密清单获取成功！")
                 return self.keyboard_info
             else:
+                self.last_error = f"获取键盘加密清单失败：{data.get('msg', '未知错误')}"
                 logging.error(f"获取键盘加密清单失败: {data.get('msg', '未知错误')}")
                 return None
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+            self.last_error = f"获取键盘加密清单失败：{e}"
             logging.error(f"获取键盘加密清单网络请求失败: {e}")
             return None
 
@@ -86,6 +89,7 @@ class ScutChargeMonitor:
         加密逻辑基于字符在标准键盘布局上的物理位置进行映射。
         """
         if not self.keyboard_info or 'numberKeyboard' not in self.keyboard_info:
+            self.last_error = "键盘加密信息不可用"
             logging.error("键盘加密信息不完整或未初始化，无法加密。")
             raise ValueError("键盘加密信息不可用")
 
@@ -114,6 +118,8 @@ class ScutChargeMonitor:
         logging.info("正在调用LLM识别验证码（将重试3次）...")
         response_text = ""  # 初始化以修复linter警告
         try:
+            from litellm import completion
+
             img_str = base64.b64encode(base64.b64decode(captcha_image_base64)).decode('utf-8')
             prompt_text = (
                 "分析这张验证码图片。验证码由英文字母和数字构成。请返回一个包含3个最可能结果的JSON数组，按可能性从高到低排序。"
@@ -132,6 +138,7 @@ class ScutChargeMonitor:
             first_message = getattr(first_choice, 'message', None) if first_choice else None
             first_content = getattr(first_message, 'content', None) if first_message else None
             if not (response and first_content):
+                self.last_error = "LLM调用失败或返回无效响应"
                 logging.error("LLM调用失败或返回了无效的响应。")
                 return None
 
@@ -148,6 +155,7 @@ class ScutChargeMonitor:
             logging.warning(f"无法将LLM响应解析为JSON，将把其作为唯一候选: {response_text}")
             return [response_text]
         except Exception as e:
+            self.last_error = f"识别验证码失败：{e}"
             logging.error(f"识别验证码时发生严重错误: {e}", exc_info=True)
             return None
 
@@ -157,6 +165,7 @@ class ScutChargeMonitor:
         """
         logging.info("正在执行认证重定向以获取 JSESSIONID...")
         if not self.token:
+            self.last_error = "缺少 access_token，无法执行认证重定向"
             logging.error("没有有效的 access_token，无法执行重定向。")
             return False
         
@@ -196,9 +205,11 @@ class ScutChargeMonitor:
                         logging.info(f"成功在二次跳转后获取到 JSESSIONID: {js_preview}")
                         return True
                 logging.warning("重定向请求完成，但未能找到 dfyc 域的 JSESSIONID cookie。")
+                self.last_error = "未获取到用电查询所需的 JSESSIONID"
                 return False
 
         except requests.exceptions.RequestException as e:
+            self.last_error = f"认证重定向失败：{e}"
             logging.error(f"认证重定向过程中发生网络错误: {e}")
             if redirect_response:
                 logging.debug(f"失败时的Cookies: {redirect_response.cookies.get_dict()}")
@@ -230,6 +241,7 @@ class ScutChargeMonitor:
             # 步骤 3: 识别验证码
             captcha_candidates = self._recognize_captcha(captcha_image_base64)
             if not captcha_candidates:
+                self.last_error = "未能识别出有效验证码"
                 logging.error("未能获取任何验证码候选，本轮尝试结束。")
                 continue
             logging.info(f"获取到验证码候选列表: {captcha_candidates}")
@@ -238,6 +250,7 @@ class ScutChargeMonitor:
             try:
                 encrypted_password = self._custom_encrypt(self.password)
             except ValueError as e:
+                self.last_error = str(e)
                 logging.error(e)
                 return False
 
@@ -266,6 +279,7 @@ class ScutChargeMonitor:
 
                 if response.status_code == 200:
                     if not isinstance(response_data, dict) or 'access_token' not in response_data:
+                        self.last_error = "登录响应不是有效的 JSON"
                         snippet = response.text[:200]
                         logging.error(f"登录响应不是有效的JSON格式: {snippet}...，错误原因：{parse_error or '缺少 access_token 字段'}")
                         continue
@@ -278,6 +292,7 @@ class ScutChargeMonitor:
                     # 登录成功后，执行认证重定向以获取用电查询所需的JSESSIONID
                     if self._perform_auth_redirect():
                         return True
+                    self.last_error = "登录成功，但获取 JSESSIONID 失败"
                     logging.error("获取JSESSIONID的认证重定向失败。")
                     return False
 
@@ -292,31 +307,39 @@ class ScutChargeMonitor:
                 if response.status_code == 400:
                     if error_code == 8002:
                         desc = message or "验证码有误"
+                        self.last_error = f"验证码错误：{desc}"
                         logging.warning(f"{context} 验证失败：{desc}。继续尝试下一个候选。")
                         continue
                     if error_code == 8000:
                         desc = message or "用户名或密码错误"
+                        self.last_error = f"账号或密码错误：{desc}"
                         logging.error(f"{context} 登录失败：{desc}。已确认账号/密码不匹配，后续不再重试。")
                         return False
                     friendly = message or "未知的业务错误"
+                    self.last_error = f"登录请求失败：{friendly}"
                     logging.error(f"{context} 登录请求返回 400：{friendly} (code={error_code})。")
                     continue
 
                 if response.status_code == 401:
                     friendly = message or "未通过身份验证（可能缺少关键字段或凭证）"
+                    self.last_error = f"登录请求被拒绝：{friendly}"
                     logging.error(f"{context} 登录请求被拒绝：{friendly} (HTTP 401)。")
                     continue
 
                 if parse_error:
+                    self.last_error = f"登录响应解析失败：{parse_error}"
                     snippet = response.text[:200]
                     logging.error(f"{context} 登录响应无法解析为JSON (HTTP {response.status_code})：{snippet}...，错误原因：{parse_error}")
                 else:
+                    self.last_error = f"登录请求HTTP错误：状态码 {response.status_code}"
                     snippet = response.text[:200]
                     logging.error(f"{context} 登录请求发生未知HTTP错误，状态码: {response.status_code}, 响应: {snippet}...")
                 continue
 
             logging.warning("本轮所有验证码候选均已尝试失败，将进入下一轮重试（若仍有剩余次数）。")
 
+        if self.last_error == "登录失败":
+            self.last_error = "所有验证码重试次数已用尽"
         logging.error("所有验证码重试次数已用尽，登录未能成功。")
         return False
 

@@ -18,6 +18,7 @@ class ChargeQuery:
             raise ValueError("传入的会话对象无效。")
         self.session = monitor_session
         self.jsessionid = jsessionid
+        self.last_error = "查询失败"
 
     def get_usage_history(self):
         """
@@ -31,6 +32,7 @@ class ChargeQuery:
         try:
             # 显式携带JSESSIONID（该cookie属于dfyc域，登录阶段已捕获其值）
             if not self.jsessionid:
+                self.last_error = "缺少 JSESSIONID"
                 logging.warning("未找到 JSESSIONID，用电历史查询可能失败。")
             cookie_dict = {'JSESSIONID': self.jsessionid} if self.jsessionid else None
             response = self.session.get(self.USAGE_HISTORY_URL, params=params, cookies=cookie_dict)
@@ -49,10 +51,13 @@ class ChargeQuery:
                     logging.info("用电历史记录为空。")
                     # 如果没有历史记录，我们无法知道剩余电量，返回0
                     return [], 0.0
+            self.last_error = f"查询失败：{data.get('message', '返回数据格式不符合预期')}"
 
         except json.JSONDecodeError:
+            self.last_error = "查询响应不是有效的 JSON"
             logging.error(f"解析用电历史响应失败，响应内容非JSON格式：{response.text if response else 'N/A'}")
         except Exception as e:
+            self.last_error = f"查询用电历史失败：{e}"
             logging.error(f"查询用电历史时发生未知错误: {e}")
 
         return None, None
