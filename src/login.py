@@ -159,7 +159,98 @@ class ScutChargeMonitor:
         if not self.token:
             logging.error("没有有效的 access_token，无法执行重定向。")
             return False
-        
+
+        def _preview_value(value):
+            if value is None:
+                return None
+            value = str(value)
+            if len(value) <= 8:
+                return f"{value[:2]}...({len(value)})"
+            return f"{value[:4]}...{value[-4:]}({len(value)})"
+
+        def _preview_cookie_header(header_value):
+            if not header_value:
+                return None
+            parts = []
+            for part in str(header_value).split(';'):
+                part = part.strip()
+                if '=' in part:
+                    name, value = part.split('=', 1)
+                    parts.append(f"{name}={_preview_value(value)}")
+                else:
+                    parts.append(part)
+            return '; '.join(parts)
+
+        def _preview_url(url):
+            if not url or '?' not in str(url):
+                return url
+            base, query = str(url).split('?', 1)
+            safe_params = []
+            for param in query.split('&'):
+                if '=' not in param:
+                    safe_params.append(param)
+                    continue
+                name, value = param.split('=', 1)
+                if name.lower() in ('synjones-auth', 'access_token', 'token', 'password'):
+                    value = _preview_value(value)
+                safe_params.append(f"{name}={value}")
+            return f"{base}?{'&'.join(safe_params)}"
+
+        def _preview_text(text):
+            if text is None:
+                return None
+            text = str(text)
+            for secret, label in ((self.token, 'token'), (self.password, 'password')):
+                if secret:
+                    text = text.replace(str(secret), f"<{label}:{_preview_value(secret)}>")
+            return text[:300]
+
+        def _log_auth_redirect_exception(error):
+            response = getattr(error, 'response', None)
+            request = getattr(error, 'request', None)
+            status = response.status_code if response is not None else None
+            url = response.url if response is not None else getattr(request, 'url', None)
+            logging.error(
+                f"认证重定向过程中发生网络错误: type={type(error).__name__}, "
+                f"status={status}, url={_preview_url(url)}"
+            )
+
+        def _log_auth_redirect_failure(initial_response, follow_response):
+            debug_enabled = os.getenv('SCUT_AUTH_DEBUG') == '1'
+            response = follow_response if follow_response is not None else initial_response
+            if response is not None:
+                logging.warning(f"认证重定向最终响应: status={response.status_code}, url={_preview_url(response.url)}")
+                set_cookie = response.headers.get('Set-Cookie')
+                if debug_enabled:
+                    logging.warning(f"认证重定向最终 Set-Cookie: {_preview_cookie_header(set_cookie)}")
+                else:
+                    logging.warning(f"认证重定向最终 Set-Cookie 存在: {bool(set_cookie)}")
+            if not debug_enabled:
+                logging.info("设置 SCUT_AUTH_DEBUG=1 可输出认证重定向历史和Cookie预览。")
+                return
+
+            if initial_response is not None:
+                location = _preview_url(initial_response.headers.get('Location'))
+                logging.warning(
+                    f"认证重定向初始响应: status={initial_response.status_code}, url={_preview_url(initial_response.url)}, "
+                    f"location={location}, set_cookie={_preview_cookie_header(initial_response.headers.get('Set-Cookie'))}"
+                )
+            if follow_response is not None:
+                for idx, history_response in enumerate(follow_response.history, 1):
+                    logging.warning(
+                        f"认证重定向历史[{idx}]: status={history_response.status_code}, url={_preview_url(history_response.url)}, "
+                        f"location={_preview_url(history_response.headers.get('Location'))}, "
+                        f"set_cookie={_preview_cookie_header(history_response.headers.get('Set-Cookie'))}"
+                    )
+            if response is not None:
+                logging.warning(f"认证重定向最终响应体片段: {_preview_text(response.text)}")
+
+            cookie_previews = [
+                f"{cookie.domain} {cookie.name}={_preview_value(cookie.value)}"
+                for cookie in self.session.cookies
+            ]
+            logging.warning(f"认证失败时 session cookies: {cookie_previews}")
+
         params = {
             'appId': '360',
             'loginFrom': 'h5',
@@ -167,8 +258,9 @@ class ScutChargeMonitor:
             'synjones-auth': self.token,
             'type': 'app'
         }
-        
+
         redirect_response = None
+        follow_response = None
         try:
             # 我们不关心最终内容，只关心cookie是否被设置，所以禁止重定向，手动处理
             redirect_response = self.session.get(self.REDIRECT_URL, params=params, allow_redirects=False)
@@ -186,8 +278,8 @@ class ScutChargeMonitor:
                 # 如果第一次请求没有直接设置cookie（可能在Location头里），则跟进跳转
                 if redirect_response.headers and 'Location' in redirect_response.headers:
                     location_url = redirect_response.headers['Location']
-                    logging.info(f"正在跟随跳转到: {location_url[:70]}...")
-                    self.session.get(location_url, allow_redirects=True) # 允许requests处理后续跳转
+                    logging.info(f"正在跟随跳转到: {_preview_url(location_url)[:70]}...")
+                    follow_response = self.session.get(location_url, allow_redirects=True) # 允许requests处理后续跳转
                     # 再次检查cookie
                     dfyc_cookies = [cookie for cookie in self.session.cookies if cookie.name == 'JSESSIONID' and 'dfyc.utc.scut.edu.cn' in cookie.domain]
                     if dfyc_cookies:
@@ -196,14 +288,12 @@ class ScutChargeMonitor:
                         logging.info(f"成功在二次跳转后获取到 JSESSIONID: {js_preview}")
                         return True
                 logging.warning("重定向请求完成，但未能找到 dfyc 域的 JSESSIONID cookie。")
+                _log_auth_redirect_failure(redirect_response, follow_response)
                 return False
 
         except requests.exceptions.RequestException as e:
-            logging.error(f"认证重定向过程中发生网络错误: {e}")
-            if redirect_response:
-                logging.debug(f"失败时的Cookies: {redirect_response.cookies.get_dict()}")
-                logging.debug(f"失败时的响应头: {redirect_response.headers}")
-                logging.debug(f"失败时的响应体: {redirect_response.text[:300]}")
+            _log_auth_redirect_exception(e)
+            _log_auth_redirect_failure(redirect_response, follow_response)
             return False
 
     def login(self):
