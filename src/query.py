@@ -56,3 +56,28 @@ class ChargeQuery:
             logging.error(f"查询用电历史时发生未知错误: {e}")
 
         return None, None
+
+    def get_realtime_balance(self):
+        """
+        查询实时剩余电量和金额。
+        :return: 一个元组 (left_ele, left_money)，失败则返回 (None, None)。
+        """
+        logging.info("正在查询实时剩余电量...")
+        url = 'https://dfyc.utc.scut.edu.cn/sdms-weixin-pay-sp/service/ammeterBalance'
+        params = {'type': '1'}
+        cookie_dict = {'JSESSIONID': self.jsessionid} if self.jsessionid else None
+        try:
+            response = self.session.get(url, params=params, cookies=cookie_dict)
+            response.raise_for_status()
+            data = response.json()
+            if str(data.get('statusCode')) == '200' and 'resultObject' in data:
+                obj = data['resultObject']
+                left_ele = float(obj['leftEle'])
+                left_money = float(obj['leftMoney'])
+                logging.info(f"实时余额查询成功：剩余 {left_ele} 度 / {left_money} 元")
+                return left_ele, left_money
+            else:
+                logging.error(f"实时余额查询失败：{data}")
+        except Exception as e:
+            logging.error(f"查询实时余额时发生错误: {e}")
+        return None, None

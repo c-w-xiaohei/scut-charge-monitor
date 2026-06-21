@@ -60,8 +60,13 @@ class EmailNotifier(NotificationChannel):
         msg['Subject'] = subject
 
         try:
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls()
+            if self.smtp_port in (465, 994):
+                server_cm = smtplib.SMTP_SSL(self.smtp_server, self.smtp_port)
+            else:
+                server_cm = smtplib.SMTP(self.smtp_server, self.smtp_port)
+            with server_cm as server:
+                if self.smtp_port == 587:
+                    server.starttls()
                 server.login(self.smtp_user, self.smtp_password)
                 # 显式传入收件人列表，确保所有人都能收到
                 server.send_message(msg, to_addrs=self.recipient_emails)
@@ -104,6 +109,8 @@ class NotificationManager:
         :param prediction: 预测结果字典。
         :param alert: 告警结果字典。
         """
+        force_send = os.getenv("EMAIL_FORCE_SEND", "").lower() in ("1", "true", "yes")
+
         if not alert:
             logging.info("无告警信息，无需发送通知。")
             return
@@ -112,7 +119,7 @@ class NotificationManager:
         is_low_balance = alert.get('is_alert', False)
         is_urgent_runout = prediction and prediction.get('days_left', float('inf')) < 3
 
-        if not is_low_balance and not is_urgent_runout:
+        if not force_send and not is_low_balance and not is_urgent_runout:
             logging.info("电量充足且不紧急，无需发送告警。")
             # 对于非告警情况，只使用日志记录完整报告
             subject, body = self._format_report(prediction, alert, is_alert=False)
@@ -120,7 +127,7 @@ class NotificationManager:
             return
 
         # 生成告警信息并发送
-        subject, body = self._format_report(prediction, alert, is_alert=True)
+        subject, body = self._format_report(prediction, alert, is_alert=is_low_balance or is_urgent_runout)
         for channel in self.channels:
             try:
                 channel.send(subject, body)
