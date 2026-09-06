@@ -38,10 +38,11 @@ def main():
     if monitor.login():
         logging.info("登录成功，正在获取用电历史记录...")
         
-        # 创建查询实例并获取用电历史和剩余电量
+        # 创建查询实例并获取用电历史和实时剩余电量
         query_agent = ChargeQuery(monitor.session, monitor.jsessionid)
-        usage_history, left_quantity = query_agent.get_usage_history()
-        
+        usage_history, _ = query_agent.get_usage_history()
+        left_quantity, _ = query_agent.get_realtime_balance()
+
         if usage_history is not None and left_quantity is not None:
             # 预测电量耗尽日期
             prediction = UsageAnalyzer.predict_runout_date(usage_history, left_quantity)
